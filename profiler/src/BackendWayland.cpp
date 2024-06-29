@@ -227,14 +227,104 @@ static bool s_wheel;
 
 extern tracy::Config s_config;
 
+#include <dlfcn.h>
+#include "third_party/libdecor.h"
+
+struct libdecor_library
+{
+    bool IsValid;
+    
+    int FunctionCount;
+    void **Functions;
+    char **FunctionNames;
+};
+
+struct libdecor_functions
+{
+    decltype(libdecor_new) *_new;
+    decltype(libdecor_state_new) *state_new;
+    decltype(libdecor_state_free) *state_free;
+    decltype(libdecor_frame_commit) *frame_commit;
+    decltype(libdecor_decorate) *decorate;
+    decltype(libdecor_frame_set_title) *frame_set_title;
+    decltype(libdecor_frame_set_app_id) *frame_set_app_id;
+    decltype(libdecor_frame_map) *frame_map;
+    decltype(libdecor_dispatch) *dispatch;
+    decltype(libdecor_configuration_get_content_size) *configuration_get_content_size;
+    decltype(libdecor_unref) *unref;
+    decltype(libdecor_frame_unref) *frame_unref;
+};
+
+static char *LibdecorFunctionNames[] =
+{
+    "libdecor_new",
+    "libdecor_state_new",
+    "libdecor_state_free",
+    "libdecor_frame_commit",
+    "libdecor_decorate",
+    "libdecor_frame_set_title",
+    "libdecor_frame_set_app_id",
+    "libdecor_frame_map",
+    "libdecor_dispatch",
+    "libdecor_configuration_get_content_size",
+    "libdecor_unref",
+    "libdecor_frame_unref",
+};
+
+static bool UseLibdecor;
+static libdecor_functions Libdecor;
+static libdecor_interface LibdecorInterface;
+static libdecor_frame_interface LibdecorFrameInterface;
+static libdecor *LibdecorContext;
+static libdecor_frame *LibdecorFrame;
+
+static void
+LibdecorError(libdecor *Context, libdecor_error Error, const char *Message)
+{
+}
+
+static void
+LibdecorFrameConfigure(libdecor_frame *Frame, libdecor_configuration *Configuration, void *UserData)
+{
+    int Width = 0;
+    int Height = 0;
+    if(Libdecor.configuration_get_content_size(Configuration, Frame, &Width, &Height) &&
+       Width > 0 &&
+       Height > 0)
+    {
+        s_width = Width;
+        s_height = Height;
+    }
+    
+    struct libdecor_state *LibdecorState = Libdecor.state_new(s_width, s_height);
+    Libdecor.frame_commit(Frame, LibdecorState, Configuration);
+    Libdecor.state_free(LibdecorState);
+}
+
+static void
+LibdecorFrameClose(libdecor_frame *Frame, void *UserData)
+{
+    s_running = false;
+}
+
+static void
+LibdecorFrameCommit(libdecor_frame *Frame, void *UserData)
+{
+    wl_surface_commit(s_surf);
+}
+
+static void
+LibdecorFrameDismissPopup(libdecor_frame *Frame, const char *SeatName, void *UserData)
+{
+}
 
 static void RecomputeScale()
 {
     if( s_fracSurf ) return;
-
+    
     // On wl_compositor >= 6 the scale is sent explicitly via wl_surface.preferred_buffer_scale.
     if ( s_comp_version >= 6 ) return;
-
+    
     int max = 1;
     for( auto& out : s_output )
     {
@@ -277,10 +367,10 @@ static void PointerButton( void*, struct wl_pointer* pointer, uint32_t serial, u
     int b;
     switch( button )
     {
-    case BTN_LEFT: b = 0; break;
-    case BTN_MIDDLE: b = 2; break;
-    case BTN_RIGHT: b = 1; break;
-    default: return;
+        case BTN_LEFT: b = 0; break;
+        case BTN_MIDDLE: b = 2; break;
+        case BTN_RIGHT: b = 1; break;
+        default: return;
     }
     ImGuiIO& io = ImGui::GetIO();
     io.AddMouseButtonEvent( b, state == WL_POINTER_BUTTON_STATE_PRESSED );
@@ -344,19 +434,19 @@ static void KeyboardKeymap( void*, struct wl_keyboard* kbd, uint32_t format, int
         close( fd );
         return;
     }
-
+    
     auto map = (char*)mmap( nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0 );
     close( fd );
     if( map == MAP_FAILED ) return;
-
+    
     if( s_xkbKeymap ) xkb_keymap_unref( s_xkbKeymap );
     s_xkbKeymap = xkb_keymap_new_from_string( s_xkbCtx, map, XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS );
     munmap( map, size );
     if( !s_xkbKeymap ) return;
-
+    
     if( s_xkbState ) xkb_state_unref( s_xkbState );
     s_xkbState = xkb_state_new( s_xkbKeymap );
-
+    
     const char* locale = getenv( "LC_ALL" );
     if( !locale )
     {
@@ -370,13 +460,13 @@ static void KeyboardKeymap( void*, struct wl_keyboard* kbd, uint32_t format, int
             }
         }
     }
-
+    
     if( s_xkbComposeTable ) xkb_compose_table_unref( s_xkbComposeTable );
     s_xkbComposeTable = xkb_compose_table_new_from_locale( s_xkbCtx, locale, XKB_COMPOSE_COMPILE_NO_FLAGS );
-
+    
     if( s_xkbComposeState ) xkb_compose_state_unref( s_xkbComposeState );
     s_xkbComposeState = xkb_compose_state_new( s_xkbComposeTable, XKB_COMPOSE_STATE_NO_FLAGS );
-
+    
     s_xkbCtrl = xkb_keymap_mod_get_index( s_xkbKeymap, "Control" );
     s_xkbAlt = xkb_keymap_mod_get_index( s_xkbKeymap, "Mod1" );
     s_xkbShift = xkb_keymap_mod_get_index( s_xkbKeymap, "Shift" );
@@ -401,13 +491,13 @@ static xkb_keysym_t Compose( const xkb_keysym_t sym )
     if( xkb_compose_state_feed( s_xkbComposeState, sym ) != XKB_COMPOSE_FEED_ACCEPTED ) return sym;
     switch( xkb_compose_state_get_status( s_xkbComposeState ) )
     {
-    case XKB_COMPOSE_COMPOSED:
+        case XKB_COMPOSE_COMPOSED:
         return xkb_compose_state_get_one_sym( s_xkbComposeState );
-    case XKB_COMPOSE_COMPOSING:
-    case XKB_COMPOSE_CANCELLED:
+        case XKB_COMPOSE_COMPOSING:
+        case XKB_COMPOSE_CANCELLED:
         return XKB_KEY_NoSymbol;
-    case XKB_COMPOSE_NOTHING:
-    default:
+        case XKB_COMPOSE_NOTHING:
+        default:
         return sym;
     }
 }
@@ -419,7 +509,7 @@ static void KeyboardKey( void*, struct wl_keyboard* kbd, uint32_t serial, uint32
     {
         io.AddKeyEvent( s_keyTable[key], state == WL_KEYBOARD_KEY_STATE_PRESSED );
     }
-
+    
     if( state == WL_KEYBOARD_KEY_STATE_PRESSED )
     {
         const xkb_keysym_t* keysyms;
@@ -438,9 +528,9 @@ static void KeyboardKey( void*, struct wl_keyboard* kbd, uint32_t serial, uint32
 static void KeyboardModifiers( void*, struct wl_keyboard* kbd, uint32_t serial, uint32_t mods_depressed, uint32_t mods_latched, uint32_t mods_locked, uint32_t group )
 {
     xkb_state_update_mask( s_xkbState, mods_depressed, mods_latched, mods_locked, 0, 0, group );
-
+    
     auto& io = ImGui::GetIO();
-
+    
     io.AddKeyEvent( ImGuiMod_Ctrl, xkb_state_mod_index_is_active( s_xkbState, s_xkbCtrl, XKB_STATE_MODS_EFFECTIVE ) );
     io.AddKeyEvent( ImGuiMod_Shift, xkb_state_mod_index_is_active( s_xkbState, s_xkbShift, XKB_STATE_MODS_EFFECTIVE ) );
     io.AddKeyEvent( ImGuiMod_Alt, xkb_state_mod_index_is_active( s_xkbState, s_xkbAlt, XKB_STATE_MODS_EFFECTIVE ) );
@@ -465,7 +555,7 @@ static void SeatCapabilities( void*, struct wl_seat* seat, uint32_t caps )
 {
     const bool hasPointer = caps & WL_SEAT_CAPABILITY_POINTER;
     const bool hasKeyboard = caps & WL_SEAT_CAPABILITY_KEYBOARD;
-
+    
     if( hasPointer && !s_pointer )
     {
         s_pointer = wl_seat_get_pointer( s_seat );
@@ -482,7 +572,7 @@ static void SeatCapabilities( void*, struct wl_seat* seat, uint32_t caps )
         wl_pointer_release( s_pointer );
         s_pointer = nullptr;
     }
-
+    
     if( hasKeyboard && !s_keyboard )
     {
         s_keyboard = wl_seat_get_keyboard( s_seat );
@@ -631,7 +721,7 @@ constexpr struct xdg_surface_listener xdgSurfaceListener = {
 static void XdgToplevelConfigure( void*, struct xdg_toplevel* toplevel, int32_t width, int32_t height, struct wl_array* states )
 {
     if( width == 0 || height == 0 ) return;
-
+    
     bool max = false;
     auto data = (uint32_t*)states->data;
     for( size_t i = 0; i < states->size / sizeof(uint32_t); i++ )
@@ -643,7 +733,7 @@ static void XdgToplevelConfigure( void*, struct xdg_toplevel* toplevel, int32_t 
         }
     }
     s_maximized = max;
-
+    
     s_width = width;
     s_height = height;
 }
@@ -716,16 +806,16 @@ constexpr struct wp_fractional_scale_v1_listener fractionalListener = {
 static void SetupCursor()
 {
     if( s_cursorShape ) return;
-
+    
     auto env_xcursor_theme = getenv( "XCURSOR_THEME" );
     auto env_xcursor_size = getenv( "XCURSOR_SIZE" );
-
+    
     int size = env_xcursor_size ? atoi( env_xcursor_size ) : 24;
     size = size * s_maxScale / 120;
-
+    
     if( s_cursorSurf ) wl_surface_destroy( s_cursorSurf );
     if( s_cursorTheme ) wl_cursor_theme_destroy( s_cursorTheme );
-
+    
     s_cursorTheme = wl_cursor_theme_load( env_xcursor_theme, size, s_shm );
     auto cursor = wl_cursor_theme_get_cursor( s_cursorTheme, "left_ptr" );
     s_cursorSurf = wl_compositor_create_surface( s_comp );
@@ -742,38 +832,79 @@ Backend::Backend( const char* title, const std::function<void()>& redraw, const 
     s_scaleChanged = scaleChanged;
     s_isBusy = isBusy;
     s_mainThreadTasks = mainThreadTasks;
-
+    
     s_prevWidth = s_width = m_winPos.w;
     s_prevHeight = s_height = m_winPos.h;
     s_maximized = m_winPos.maximize;
-
+    
     s_dpy = wl_display_connect( nullptr );
     if( !s_dpy ) { fprintf( stderr, "Cannot establish wayland display connection!\n" ); exit( 1 ); }
-
+    
     wl_registry_add_listener( wl_display_get_registry( s_dpy ), &registryListener, nullptr );
     s_xkbCtx = xkb_context_new( XKB_CONTEXT_NO_FLAGS );
     wl_display_roundtrip( s_dpy );
-
+    
     if( !s_comp ) { fprintf( stderr, "No wayland compositor!\n" ); exit( 1 ); }
     if( !s_shm ) { fprintf( stderr, "No wayland shared memory!\n" ); exit( 1 ); }
     if( !s_wm ) { fprintf( stderr, "No wayland window manager!\n" ); exit( 1 ); }
     if( !s_seat ) { fprintf( stderr, "No wayland seat!\n" ); exit( 1 ); }
-
+    
+    if(!s_decoration)
+    {
+        libdecor_library LibdecorCode = {};
+        LibdecorCode.Functions = (void **)&Libdecor;
+        LibdecorCode.FunctionCount = sizeof(LibdecorFunctionNames)/sizeof(LibdecorFunctionNames[0]);
+        LibdecorCode.FunctionNames = LibdecorFunctionNames;
+        
+        void *Handle = dlopen("libdecor-0.so.0", RTLD_LOCAL|RTLD_NOW);
+        if(Handle)
+        {
+            LibdecorCode.IsValid = true;
+            
+            for(int FunctionIndex = 0;
+                FunctionIndex < LibdecorCode.FunctionCount;
+                ++FunctionIndex)
+            {
+                void *Function = dlsym(Handle, LibdecorCode.FunctionNames[FunctionIndex]);
+                if(!Function)
+                {
+                    LibdecorCode.IsValid = false;
+                    break;
+                }
+                
+                LibdecorCode.Functions[FunctionIndex] = Function;
+            }
+            
+            if(LibdecorCode.IsValid)
+            {
+                UseLibdecor = true;
+                
+                xdg_wm_base_destroy(s_wm);
+                s_wm = 0;
+                
+                LibdecorInterface.error = LibdecorError;
+                
+                LibdecorFrameInterface.configure = LibdecorFrameConfigure;
+                LibdecorFrameInterface.close = LibdecorFrameClose;
+                LibdecorFrameInterface.commit = LibdecorFrameCommit;
+                LibdecorFrameInterface.dismiss_popup = LibdecorFrameDismissPopup;
+            }
+        }
+    }
+    
     s_surf = wl_compositor_create_surface( s_comp );
     wl_surface_add_listener( s_surf, &surfaceListener, nullptr );
     s_eglWin = wl_egl_window_create( s_surf, m_winPos.w, m_winPos.h );
-    s_xdgSurf = xdg_wm_base_get_xdg_surface( s_wm, s_surf );
-    xdg_surface_add_listener( s_xdgSurf, &xdgSurfaceListener, nullptr );
-
+    
     if( s_fractionalScale && s_viewporter )
     {
         s_fracSurf = wp_fractional_scale_manager_v1_get_fractional_scale( s_fractionalScale, s_surf );
         wp_fractional_scale_v1_add_listener( s_fracSurf, &fractionalListener, nullptr );
         s_viewport = wp_viewporter_get_viewport( s_viewporter, s_surf );
     }
-
+    
     SetupCursor();
-
+    
     constexpr EGLint eglConfigAttrib[] = {
         EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
         EGL_RED_SIZE, 8,
@@ -782,50 +913,68 @@ Backend::Backend( const char* title, const std::function<void()>& redraw, const 
         EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
         EGL_NONE
     };
-
+    
     s_eglDpy = eglGetPlatformDisplay( EGL_PLATFORM_WAYLAND_KHR, s_dpy, nullptr );
     EGLBoolean res;
     res = eglInitialize( s_eglDpy, nullptr, nullptr );
     if( res != EGL_TRUE ) { fprintf( stderr, "Cannot initialize EGL!\n" ); exit( 1 ); }
-
+    
     EGLint count;
     EGLConfig eglConfig;
     res = eglChooseConfig( s_eglDpy, eglConfigAttrib, &eglConfig, 1, &count );
     if( res != EGL_TRUE || count != 1 ) { fprintf( stderr, "No suitable EGL config found!\n" ); exit( 1 ); }
-
+    
     res = eglBindAPI( EGL_OPENGL_API );
     if( res != EGL_TRUE ) { fprintf( stderr, "Cannot use OpenGL through EGL!\n" ); exit( 1 ); }
-
+    
     s_eglSurf = eglCreatePlatformWindowSurface( s_eglDpy, eglConfig, s_eglWin, nullptr );
-
+    
     constexpr EGLint eglCtxAttrib[] = {
         EGL_CONTEXT_MAJOR_VERSION, 3,
         EGL_CONTEXT_MINOR_VERSION, 2,
         EGL_CONTEXT_OPENGL_PROFILE_MASK,  EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
         EGL_NONE
     };
-
+    
     s_eglCtx = eglCreateContext( s_eglDpy, eglConfig, EGL_NO_CONTEXT, eglCtxAttrib );
     if( !s_eglCtx ) { fprintf( stderr, "Cannot create OpenGL 3.2 Core Profile context!\n" ); exit( 1 ); }
     res = eglMakeCurrent( s_eglDpy, s_eglSurf, s_eglSurf, s_eglCtx );
     if( res != EGL_TRUE ) { fprintf( stderr, "Cannot make EGL context current!\n" ); exit( 1 ); }
-
+    
     ImGui_ImplOpenGL3_Init( "#version 150" );
-
+    
     wl_display_roundtrip( s_dpy );
-    s_toplevel = xdg_surface_get_toplevel( s_xdgSurf );
-    xdg_toplevel_add_listener( s_toplevel, &toplevelListener, nullptr );
-    xdg_toplevel_set_title( s_toplevel, title );
-    xdg_toplevel_set_app_id( s_toplevel, "tracy" );
-
-    if( s_decoration )
+    
+    if(UseLibdecor)
     {
-        s_tldec = zxdg_decoration_manager_v1_get_toplevel_decoration( s_decoration, s_toplevel );
-        zxdg_toplevel_decoration_v1_add_listener( s_tldec, &decorationListener, nullptr );
-        zxdg_toplevel_decoration_v1_set_mode( s_tldec, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE );
-        wl_display_roundtrip( s_dpy );
+        LibdecorContext = Libdecor._new(s_dpy, &LibdecorInterface);
+        LibdecorFrame = Libdecor.decorate(LibdecorContext, s_surf, &LibdecorFrameInterface, &Libdecor);
+        
+        Libdecor.frame_set_title(LibdecorFrame, title);
+        Libdecor.frame_set_app_id(LibdecorFrame, "tracy");
+        Libdecor.frame_map(LibdecorFrame);
     }
-
+    else
+    {
+        s_xdgSurf = xdg_wm_base_get_xdg_surface( s_wm, s_surf );
+        xdg_surface_add_listener( s_xdgSurf, &xdgSurfaceListener, nullptr );
+        
+        s_toplevel = xdg_surface_get_toplevel( s_xdgSurf );
+        xdg_toplevel_add_listener( s_toplevel, &toplevelListener, nullptr );
+        
+        xdg_toplevel_set_title( s_toplevel, title );
+        xdg_toplevel_set_app_id( s_toplevel, "tracy" );
+        
+        if( s_decoration )
+        {
+            s_tldec = zxdg_decoration_manager_v1_get_toplevel_decoration( s_decoration, s_toplevel );
+            zxdg_toplevel_decoration_v1_add_listener( s_tldec, &decorationListener, nullptr );
+            zxdg_toplevel_decoration_v1_set_mode( s_tldec, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE );
+            
+            wl_display_roundtrip( s_dpy );
+        }
+    }
+    
     ImGuiIO& io = ImGui::GetIO();
     io.BackendPlatformName = "wayland (tracy profiler)";
     s_time = std::chrono::duration_cast<std::chrono::microseconds>( std::chrono::high_resolution_clock::now().time_since_epoch() ).count();
@@ -834,7 +983,7 @@ Backend::Backend( const char* title, const std::function<void()>& redraw, const 
 Backend::~Backend()
 {
     ImGui_ImplOpenGL3_Shutdown();
-
+    
     if( s_cursorShapeDev ) wp_cursor_shape_device_v1_destroy( s_cursorShapeDev );
     if( s_cursorShape ) wp_cursor_shape_manager_v1_destroy( s_cursorShape );
     if( s_viewport ) wp_viewport_destroy( s_viewport );
@@ -851,16 +1000,17 @@ Backend::~Backend()
     eglDestroySurface( s_eglDpy, s_eglSurf );
     eglDestroyContext( s_eglDpy, s_eglCtx );
     eglTerminate( s_eglDpy );
-    xdg_toplevel_destroy( s_toplevel );
+    if( s_toplevel) xdg_toplevel_destroy( s_toplevel );
     if( s_cursorSurf ) wl_surface_destroy( s_cursorSurf );
     if( s_cursorTheme ) wl_cursor_theme_destroy( s_cursorTheme );
-    xdg_surface_destroy( s_xdgSurf );
+    if( s_xdgSurf ) xdg_surface_destroy( s_xdgSurf );
+    if(UseLibdecor) Libdecor.frame_unref(LibdecorFrame);
     wl_egl_window_destroy( s_eglWin );
     wl_surface_destroy( s_surf );
     for( auto& v : s_output ) wl_output_destroy( v.second->obj );
     s_output.clear();
     wl_seat_destroy( s_seat );
-    xdg_wm_base_destroy( s_wm );
+    if( s_wm ) xdg_wm_base_destroy( s_wm );
     wl_shm_destroy( s_shm );
     wl_compositor_destroy( s_comp );
     if( s_xkbComposeState ) xkb_compose_state_unref( s_xkbComposeState );
@@ -868,6 +1018,7 @@ Backend::~Backend()
     if( s_xkbState ) xkb_state_unref( s_xkbState );
     if( s_xkbKeymap ) xkb_keymap_unref( s_xkbKeymap );
     xkb_context_unref( s_xkbCtx );
+    if(UseLibdecor) Libdecor.unref(LibdecorContext);
     wl_display_disconnect( s_dpy );
 }
 
@@ -878,8 +1029,17 @@ void Backend::Show()
 
 void Backend::Run()
 {
-    while( s_running && wl_display_dispatch( s_dpy ) != -1 )
+    while( s_running )
     {
+        if(UseLibdecor && Libdecor.dispatch(LibdecorContext, -1) == -1)
+        {
+            s_running = false;
+        }
+        else if(!UseLibdecor && wl_display_dispatch( s_dpy ) == -1)
+        {
+            s_running = false;
+        }
+        
         if( s_config.focusLostLimit && !s_hasFocus ) std::this_thread::sleep_for( std::chrono::milliseconds( 50 ) );
         s_redraw();
         s_mainThreadTasks->Run();
@@ -922,7 +1082,7 @@ void Backend::NewFrame( int& w, int& h )
             wp_viewport_set_destination( s_viewport, s_width, s_height );
         }
     }
-
+    
     if( s_prevScale != s_maxScale )
     {
         s_scaleChanged( s_maxScale / 120.f );
@@ -930,74 +1090,74 @@ void Backend::NewFrame( int& w, int& h )
         if( !s_fracSurf ) wl_surface_set_buffer_scale( s_surf, s_maxScale / 120 );
         s_prevScale = s_maxScale;
     }
-
+    
     m_winPos.maximize = s_maximized;
     if( !s_maximized )
     {
         m_winPos.w = s_width;
         m_winPos.h = s_height;
     }
-
+    
     w = s_width * s_maxScale / 120;
     h = s_height * s_maxScale / 120;
-
+    
     ImGuiIO& io = ImGui::GetIO();
     io.DisplaySize = ImVec2( w, h );
     io.DisplayFramebufferScale = ImVec2( 1, 1 );
-
+    
     ImGui_ImplOpenGL3_NewFrame();
-
+    
     uint64_t time = std::chrono::duration_cast<std::chrono::microseconds>( std::chrono::high_resolution_clock::now().time_since_epoch() ).count();
     io.DeltaTime = std::min( 0.1f, ( time - s_time ) / 1000000.f );
     s_time = time;
-
+    
     if( s_cursorShapeDev )
     {
         ImGuiMouseCursor cursor = ImGui::GetMouseCursor();
         wp_cursor_shape_device_v1_shape shape;
-
+        
         switch( cursor )
         {
-        case ImGuiMouseCursor_None:
+            case ImGuiMouseCursor_None:
             shape = (wp_cursor_shape_device_v1_shape)0;
             break;
-        case ImGuiMouseCursor_Arrow:
+            case ImGuiMouseCursor_Arrow:
             switch( s_isBusy() )
             {
-            default:
-            case 0:
+                default:
+                case 0:
                 shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT;
                 break;
-            case 1:
+                case 1:
                 shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_PROGRESS;
                 break;
-            case 2:
+                case 2:
                 shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_WAIT;
                 break;
             }
             break;
-        case ImGuiMouseCursor_TextInput:
+            case ImGuiMouseCursor_TextInput:
             shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_TEXT;
             break;
-        case ImGuiMouseCursor_ResizeNS:
+            case ImGuiMouseCursor_ResizeNS:
             shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NS_RESIZE;
             break;
-        case ImGuiMouseCursor_ResizeEW:
+            case ImGuiMouseCursor_ResizeEW:
             shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_EW_RESIZE;
             break;
-        case ImGuiMouseCursor_ResizeNESW:
+            case ImGuiMouseCursor_ResizeNESW:
             shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NESW_RESIZE;
             break;
-        case ImGuiMouseCursor_ResizeNWSE:
+            case ImGuiMouseCursor_ResizeNWSE:
             shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NWSE_RESIZE;
             break;
-        case ImGuiMouseCursor_NotAllowed:
+            case ImGuiMouseCursor_NotAllowed:
             shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NOT_ALLOWED;
             break;
-        default:
+            default:
             break;
         };
-
+        
         if( shape != s_mouseCursor )
         {
             s_mouseCursor = shape;
@@ -1016,13 +1176,13 @@ void Backend::NewFrame( int& w, int& h )
 void Backend::EndFrame()
 {
     const ImVec4 clear_color = ImColor( 20, 20, 17 );
-
+    
     ImGui::Render();
     glViewport( 0, 0, s_width * s_maxScale / 120, s_height * s_maxScale / 120 );
     glClearColor( clear_color.x, clear_color.y, clear_color.z, clear_color.w );
     glClear( GL_COLOR_BUFFER_BIT );
     ImGui_ImplOpenGL3_RenderDrawData( ImGui::GetDrawData() );
-
+    
     eglSwapBuffers( s_eglDpy, s_eglSurf );
 }
 
@@ -1032,7 +1192,14 @@ void Backend::SetIcon( uint8_t* data, int w, int h )
 
 void Backend::SetTitle( const char* title )
 {
-    xdg_toplevel_set_title( s_toplevel, title );
+    if(UseLibdecor)
+    {
+        Libdecor.frame_set_title(LibdecorFrame, title);
+    }
+    else
+    {
+        xdg_toplevel_set_title( s_toplevel, title );
+    }
 }
 
 float Backend::GetDpiScale()
